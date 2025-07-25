@@ -71,270 +71,6 @@ export default function ProductCounter() {
     }
   }
 
-  const findAllPages = async (baseUrl: string): Promise<string[]> => {
-    console.log('🔍 Finding all pages for:', baseUrl)
-    setProgressText('Discovering all website pages...')
-    
-    try {
-      const domain = new URL(baseUrl).hostname
-      const allPages = new Set<string>([baseUrl])
-      
-      // Step 1: Scrape homepage for internal links
-      console.log('📄 Scraping homepage for links...')
-      const { links, markdown } = await blink.data.scrape(baseUrl)
-      
-      if (links && links.length > 0) {
-        console.log(`Found ${links.length} links on homepage`)
-        
-        // Filter for internal links that might contain products
-        links.forEach(link => {
-          try {
-            const linkUrl = new URL(link, baseUrl)
-            if (linkUrl.hostname === domain) {
-              const path = linkUrl.pathname.toLowerCase()
-              
-              // Add all internal pages, we'll filter later
-              if (
-                path.includes('/product') ||
-                path.includes('/item') ||
-                path.includes('/shop') ||
-                path.includes('/store') ||
-                path.includes('/category') ||
-                path.includes('/collection') ||
-                path.includes('/catalog') ||
-                path.includes('/p/') ||
-                path.includes('/products/') ||
-                path.includes('/items/') ||
-                path.match(/\/\d+/) || // Product IDs
-                path.includes('page=') || // Pagination
-                path.length > 3 // Any substantial path
-              ) {
-                allPages.add(linkUrl.href)
-              }
-            }
-          } catch (e) {
-            // Skip invalid URLs
-          }
-        })
-      }
-      
-      // Step 2: Try to find sitemap for comprehensive discovery
-      try {
-        console.log('🗺️ Checking for sitemap...')
-        const sitemapUrls = [
-          `${baseUrl}/sitemap.xml`,
-          `${baseUrl}/sitemap_index.xml`,
-          `${baseUrl}/product-sitemap.xml`
-        ]
-        
-        for (const sitemapUrl of sitemapUrls) {
-          try {
-            const response = await blink.data.fetch({
-              url: sitemapUrl,
-              method: 'GET'
-            })
-            
-            if (response.status === 200 && response.body) {
-              console.log(`✅ Found sitemap: ${sitemapUrl}`)
-              const sitemapText = response.body
-              
-              // Extract URLs from sitemap
-              const urlMatches = sitemapText.match(/<loc>(.*?)<\/loc>/g)
-              if (urlMatches) {
-                urlMatches.forEach(match => {
-                  const url = match.replace(/<\/?loc>/g, '').trim()
-                  try {
-                    const urlObj = new URL(url)
-                    if (urlObj.hostname === domain) {
-                      allPages.add(url)
-                    }
-                  } catch (e) {
-                    // Skip invalid URLs
-                  }
-                })
-              }
-              break // Found a working sitemap
-            }
-          } catch (e) {
-            // Try next sitemap URL
-          }
-        }
-      } catch (e) {
-        console.log('No sitemap found, using link discovery only')
-      }
-      
-      const pages = Array.from(allPages)
-      console.log(`🎯 Discovered ${pages.length} total pages`)
-      
-      // Limit to reasonable number for performance (prioritize product-looking URLs)
-      const productPages = pages.filter(url => {
-        const path = url.toLowerCase()
-        return path.includes('/product') || path.includes('/item') || path.includes('/p/')
-      })
-      
-      const categoryPages = pages.filter(url => {
-        const path = url.toLowerCase()
-        return path.includes('/category') || path.includes('/collection') || path.includes('/shop')
-      })
-      
-      const otherPages = pages.filter(url => 
-        !productPages.includes(url) && !categoryPages.includes(url)
-      )
-      
-      // Prioritize product pages, then category pages, then others
-      const prioritizedPages = [
-        ...productPages.slice(0, 15),
-        ...categoryPages.slice(0, 10),
-        ...otherPages.slice(0, 5)
-      ].slice(0, 30) // Max 30 pages total
-      
-      console.log(`📊 Will analyze ${prioritizedPages.length} prioritized pages:`)
-      console.log(`- Product pages: ${productPages.length}`)
-      console.log(`- Category pages: ${categoryPages.length}`)
-      console.log(`- Other pages: ${otherPages.length}`)
-      
-      return prioritizedPages
-      
-    } catch (error) {
-      console.error('Error discovering pages:', error)
-      return [baseUrl] // Fallback to just homepage
-    }
-  }
-
-  const analyzePageForProducts = async (pageUrl: string, pageIndex: number, totalPages: number): Promise<PageAnalysis> => {
-    console.log(`🔍 Analyzing page ${pageIndex + 1}/${totalPages}: ${pageUrl}`)
-    
-    try {
-      // Update progress
-      setCrawlProgress(prev => ({
-        ...prev!,
-        currentPage: pageUrl,
-        pagesAnalyzed: pageIndex
-      }))
-
-      // Scrape the page content
-      console.log(`📄 Scraping content from: ${pageUrl}`)
-      const { markdown, metadata, links } = await blink.data.scrape(pageUrl)
-      
-      if (!markdown || markdown.length < 100) {
-        console.log(`❌ Page ${pageIndex + 1}: No content found`)
-        return {
-          url: pageUrl,
-          productCount: 0,
-          categories: [],
-          confidence: 0,
-          evidence: ['No content could be scraped from this page'],
-          pageType: 'unknown',
-          title: metadata?.title || 'Unknown',
-          status: 'failed',
-          errorMessage: 'Could not scrape page content'
-        }
-      }
-
-      console.log(`📝 Scraped ${markdown.length} characters from page ${pageIndex + 1}`)
-
-      // Create a very specific prompt for product counting
-      const analysisPrompt = `
-TASK: Count the exact number of products displayed on this ecommerce page.
-
-PAGE URL: ${pageUrl}
-PAGE TITLE: ${metadata?.title || 'Unknown'}
-
-CONTENT TO ANALYZE:
-${markdown.slice(0, 20000)}
-
-INSTRUCTIONS:
-1. Count ONLY actual products that are for sale on this specific page
-2. Look for clear product indicators:
-   - Product titles/names
-   - Prices ($ amounts)
-   - "Add to Cart" or "Buy Now" buttons
-   - Product images with descriptions
-   - SKU numbers or product codes
-
-3. Determine page type:
-   - "product": Single product detail page (usually count = 1)
-   - "category": Category/listing page with multiple products
-   - "homepage": Main page (may have featured products)
-   - "search": Search results page
-   - "other": Non-product page (count = 0)
-
-4. For listing/category pages: Count each distinct product shown
-5. Don't count:
-   - Navigation menu items
-   - Related/recommended products in sidebars (unless main content)
-   - Advertisements
-   - Blog posts or articles
-
-6. Look for pagination indicators like "Page 1 of 5" or "Showing 1-20 of 100 products"
-
-Respond with JSON only:
-{
-  "productCount": <exact number of products on this page>,
-  "pageType": "<product|category|homepage|search|other>",
-  "categories": ["<category1>", "<category2>"],
-  "confidence": <0-100 confidence score>,
-  "evidence": ["<specific evidence found>"],
-  "reasoning": "<brief explanation of your count>",
-  "hasPagination": <true/false if pagination detected>,
-  "totalProductsIfPaginated": <estimated total if pagination found>
-}
-`
-
-      console.log(`🤖 Sending page ${pageIndex + 1} to AI for analysis...`)
-      const { object: analysis } = await blink.ai.generateObject({
-        prompt: analysisPrompt,
-        schema: {
-          type: 'object',
-          properties: {
-            productCount: { type: 'number' },
-            pageType: { type: 'string' },
-            categories: { type: 'array', items: { type: 'string' } },
-            confidence: { type: 'number' },
-            evidence: { type: 'array', items: { type: 'string' } },
-            reasoning: { type: 'string' },
-            hasPagination: { type: 'boolean' },
-            totalProductsIfPaginated: { type: 'number' }
-          },
-          required: ['productCount', 'pageType', 'categories', 'confidence', 'evidence', 'reasoning']
-        }
-      })
-
-      console.log(`✅ Page ${pageIndex + 1} analysis complete:`, {
-        url: pageUrl,
-        count: analysis.productCount,
-        type: analysis.pageType,
-        confidence: analysis.confidence,
-        reasoning: analysis.reasoning
-      })
-
-      return {
-        url: pageUrl,
-        productCount: analysis.productCount || 0,
-        categories: analysis.categories || [],
-        confidence: analysis.confidence || 0,
-        evidence: analysis.evidence || [],
-        pageType: analysis.pageType || 'unknown',
-        title: metadata?.title || 'Unknown',
-        status: 'completed'
-      }
-
-    } catch (error) {
-      console.error(`❌ Error analyzing page ${pageIndex + 1}:`, pageUrl, error)
-      return {
-        url: pageUrl,
-        productCount: 0,
-        categories: [],
-        confidence: 0,
-        evidence: [`Analysis failed: ${error.message}`],
-        pageType: 'unknown',
-        title: 'Unknown',
-        status: 'failed',
-        errorMessage: error.message
-      }
-    }
-  }
-
   const analyzeWebsite = async () => {
     if (!url.trim()) {
       setError('Please enter a website URL')
@@ -349,7 +85,7 @@ Respond with JSON only:
       setCrawlProgress(null)
 
       const validatedUrl = validateUrl(url.trim())
-      console.log('🚀 Starting comprehensive website analysis for:', validatedUrl)
+      console.log('🚀 Starting website analysis for:', validatedUrl)
 
       // Save initial analysis record
       const analysisId = `analysis_${Date.now()}`
@@ -362,93 +98,226 @@ Respond with JSON only:
         updatedAt: new Date().toISOString()
       })
 
-      // Stage 1: Discover all pages (20% progress)
+      // Stage 1: Take screenshot and scrape content (30%)
       setProgress(10)
-      setProgressText('Discovering all website pages...')
-      const discoveredPages = await findAllPages(validatedUrl)
-      setProgress(20)
+      setProgressText('Taking website screenshot...')
       
-      console.log(`📊 Found ${discoveredPages.length} pages to analyze`)
-      
-      setCrawlProgress({
-        stage: 'Analyzing pages for products',
-        currentPage: '',
-        pagesFound: discoveredPages.length,
-        pagesAnalyzed: 0,
-        totalProducts: 0
+      console.log('📸 Taking screenshot...')
+      const screenshotUrl = await blink.data.screenshot(validatedUrl, {
+        fullPage: true,
+        width: 1400,
+        height: 1050
       })
+      console.log('✅ Screenshot captured:', screenshotUrl)
 
-      // Stage 2: Analyze each page individually (70% progress)
-      const pageResults: PageAnalysis[] = []
-      let totalProducts = 0
-      const allCategories = new Set<string>()
+      setProgress(20)
+      setProgressText('Scraping website content...')
       
-      for (let i = 0; i < discoveredPages.length; i++) {
-        const pageUrl = discoveredPages[i]
-        setProgressText(`Analyzing page ${i + 1} of ${discoveredPages.length}...`)
-        setProgress(20 + ((i + 1) / discoveredPages.length) * 70)
+      console.log('📄 Scraping website content...')
+      const { markdown, metadata, links } = await blink.data.scrape(validatedUrl)
+      console.log(`✅ Scraped ${markdown?.length || 0} characters of content`)
 
-        const pageAnalysis = await analyzePageForProducts(pageUrl, i, discoveredPages.length)
-        pageResults.push(pageAnalysis)
-        
-        if (pageAnalysis.status === 'completed') {
-          totalProducts += pageAnalysis.productCount
-          pageAnalysis.categories.forEach(cat => allCategories.add(cat))
-          
-          // Update crawl progress
-          setCrawlProgress(prev => ({
-            ...prev!,
-            pagesAnalyzed: i + 1,
-            totalProducts
-          }))
-          
-          console.log(`📈 Running total: ${totalProducts} products found across ${i + 1} pages`)
-        }
-
-        // Small delay to prevent overwhelming the API
-        await new Promise(resolve => setTimeout(resolve, 1000))
+      if (!markdown || markdown.length < 100) {
+        throw new Error('Could not scrape website content. The site may be protected or inaccessible.')
       }
 
-      // Stage 3: Compile final results (10% progress)
-      setProgress(90)
-      setProgressText('Compiling final results...')
+      // Stage 2: Analyze content for products (40%)
+      setProgress(30)
+      setProgressText('Analyzing content for products...')
 
-      const categoryBreakdown: Record<string, number> = {}
-      const pageBreakdown: Record<string, number> = {}
+      console.log('🤖 Analyzing content with AI...')
       
-      pageResults.forEach(page => {
-        if (page.status === 'completed') {
-          page.categories.forEach(category => {
-            categoryBreakdown[category] = (categoryBreakdown[category] || 0) + page.productCount
-          })
-          pageBreakdown[page.url] = page.productCount
+      // Create a comprehensive analysis prompt
+      const analysisPrompt = `You are an expert ecommerce analyst. Analyze this website to count ALL products available for purchase.
+
+WEBSITE: ${validatedUrl}
+TITLE: ${metadata?.title || 'Unknown'}
+
+CONTENT TO ANALYZE:
+${markdown.slice(0, 25000)}
+
+TASK: Count the TOTAL number of products on this entire website.
+
+INSTRUCTIONS:
+1. Look for clear product indicators:
+   - Product names/titles
+   - Prices ($ amounts, currency symbols)
+   - "Add to Cart", "Buy Now", "Shop Now" buttons
+   - Product images with descriptions
+   - SKU numbers, product codes
+   - Product listings, grids, or catalogs
+
+2. Count ALL products you can identify:
+   - Individual product pages (count = 1 per page)
+   - Product listing pages (count each distinct product)
+   - Category pages with multiple products
+   - Featured products on homepage
+   - Product grids or catalogs
+
+3. Look for pagination indicators:
+   - "Page 1 of X" or "Showing 1-20 of 100 products"
+   - "Next page", "Previous page" buttons
+   - Numbered page links
+   - "Load more" buttons
+
+4. Identify product categories:
+   - Clothing, Electronics, Books, etc.
+   - Any category names mentioned
+
+5. Don't count:
+   - Navigation menu items
+   - Blog posts or articles
+   - About/Contact pages
+   - Advertisements (unless they're products for sale)
+
+6. If you see pagination like "Showing 1-20 of 500 products", the total is 500, not 20.
+
+Provide a detailed analysis with your reasoning.
+
+Respond with JSON only:
+{
+  "totalProducts": <total number of products on entire website>,
+  "productsOnThisPage": <products visible on this specific page>,
+  "categories": ["category1", "category2"],
+  "confidence": <0-100 confidence score>,
+  "evidence": ["specific evidence found"],
+  "reasoning": "detailed explanation of your count",
+  "hasPagination": <true/false>,
+  "paginationInfo": "description of pagination if found",
+  "estimatedTotalFromPagination": <number if pagination indicates total>
+}`
+
+      const { object: analysis } = await blink.ai.generateObject({
+        prompt: analysisPrompt,
+        schema: {
+          type: 'object',
+          properties: {
+            totalProducts: { type: 'number' },
+            productsOnThisPage: { type: 'number' },
+            categories: { type: 'array', items: { type: 'string' } },
+            confidence: { type: 'number' },
+            evidence: { type: 'array', items: { type: 'string' } },
+            reasoning: { type: 'string' },
+            hasPagination: { type: 'boolean' },
+            paginationInfo: { type: 'string' },
+            estimatedTotalFromPagination: { type: 'number' }
+          },
+          required: ['totalProducts', 'productsOnThisPage', 'categories', 'confidence', 'evidence', 'reasoning']
         }
       })
 
-      const successfulPages = pageResults.filter(p => p.status === 'completed').length
-      const avgConfidence = successfulPages > 0 
-        ? Math.round(pageResults.filter(p => p.status === 'completed').reduce((acc, p) => acc + p.confidence, 0) / successfulPages)
-        : 0
+      console.log('✅ AI analysis complete:', analysis)
+
+      // Stage 3: Visual analysis of screenshot (30%)
+      setProgress(60)
+      setProgressText('Analyzing screenshot for visual product detection...')
+
+      console.log('👁️ Analyzing screenshot with AI...')
+      
+      const visualPrompt = `Analyze this ecommerce website screenshot to count products visually.
+
+Look for:
+- Product grids or listings
+- Product cards with images
+- Price tags and "Add to Cart" buttons
+- Product thumbnails
+- Shopping cart icons
+- Product galleries or catalogs
+
+Count all visible products in the image. If you see a product grid with multiple items, count each one.
+
+Respond with JSON only:
+{
+  "visualProductCount": <number of products visible in screenshot>,
+  "visualEvidence": ["what you see in the image"],
+  "layoutType": "single product page | product listing | homepage | category page",
+  "confidence": <0-100 confidence score>
+}`
+
+      const { object: visualAnalysis } = await blink.ai.generateObject({
+        prompt: visualPrompt,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: visualPrompt },
+              { type: "image", image: screenshotUrl }
+            ]
+          }
+        ],
+        schema: {
+          type: 'object',
+          properties: {
+            visualProductCount: { type: 'number' },
+            visualEvidence: { type: 'array', items: { type: 'string' } },
+            layoutType: { type: 'string' },
+            confidence: { type: 'number' }
+          },
+          required: ['visualProductCount', 'visualEvidence', 'layoutType', 'confidence']
+        }
+      })
+
+      console.log('✅ Visual analysis complete:', visualAnalysis)
+
+      // Stage 4: Combine analyses and determine final count
+      setProgress(90)
+      setProgressText('Combining analyses for final count...')
+
+      // Use the higher count between text analysis and visual analysis
+      // If pagination is detected, use that total
+      let finalProductCount = analysis.totalProducts || 0
+      
+      if (analysis.estimatedTotalFromPagination && analysis.estimatedTotalFromPagination > finalProductCount) {
+        finalProductCount = analysis.estimatedTotalFromPagination
+      }
+      
+      // If visual analysis found more products on this page, adjust accordingly
+      if (visualAnalysis.visualProductCount > analysis.productsOnThisPage) {
+        const difference = visualAnalysis.visualProductCount - analysis.productsOnThisPage
+        finalProductCount += difference
+      }
+
+      const combinedEvidence = [
+        ...analysis.evidence,
+        ...visualAnalysis.visualEvidence
+      ]
+
+      const avgConfidence = Math.round((analysis.confidence + visualAnalysis.confidence) / 2)
+
+      // Create page analysis result
+      const pageAnalysis: PageAnalysis = {
+        url: validatedUrl,
+        productCount: finalProductCount,
+        categories: analysis.categories || [],
+        confidence: avgConfidence,
+        evidence: combinedEvidence,
+        pageType: visualAnalysis.layoutType || 'unknown',
+        title: metadata?.title || 'Unknown',
+        status: 'completed'
+      }
 
       const finalResult: AnalysisResult = {
-        totalProductCount: totalProducts,
-        pagesAnalyzed: successfulPages,
-        pageResults,
-        sitemap: discoveredPages,
-        summary: `Found ${totalProducts} products across ${successfulPages} pages. Analyzed ${discoveredPages.length} pages total with ${avgConfidence}% average confidence.`,
-        status: successfulPages > 0 ? 'completed' : 'failed',
+        totalProductCount: finalProductCount,
+        pagesAnalyzed: 1,
+        pageResults: [pageAnalysis],
+        sitemap: [validatedUrl],
+        summary: `Found ${finalProductCount} products. ${analysis.reasoning} Visual analysis: ${visualAnalysis.visualEvidence.join(', ')}.`,
+        status: 'completed',
         details: {
-          totalProducts,
-          productsByCategory: categoryBreakdown,
-          analysisMethod: 'Multi-page crawl with AI analysis per page',
+          totalProducts: finalProductCount,
+          productsByCategory: analysis.categories.reduce((acc, cat) => {
+            acc[cat] = finalProductCount // Simplified - assign all products to each category
+            return acc
+          }, {} as Record<string, number>),
+          analysisMethod: 'Combined text and visual AI analysis',
           confidence: avgConfidence,
-          pageBreakdown
+          pageBreakdown: { [validatedUrl]: finalProductCount }
         }
       }
 
       // Update database record
       await blink.db.productAnalyses.update(analysisId, {
-        productCount: totalProducts,
+        productCount: finalProductCount,
         analysisStatus: 'completed',
         analysisDetails: JSON.stringify(finalResult),
         updatedAt: new Date().toISOString()
@@ -457,14 +326,6 @@ Respond with JSON only:
       setResult(finalResult)
       setProgress(100)
       setProgressText('Analysis complete!')
-      
-      setCrawlProgress({
-        stage: 'Complete',
-        currentPage: '',
-        pagesFound: discoveredPages.length,
-        pagesAnalyzed: pageResults.length,
-        totalProducts
-      })
 
       console.log('🎉 Analysis complete! Final result:', finalResult)
 
@@ -474,6 +335,22 @@ Respond with JSON only:
     } catch (error) {
       console.error('❌ Analysis failed:', error)
       setError(error.message || 'Analysis failed. Please try again.')
+      
+      // Update database record as failed
+      try {
+        const analysisId = `analysis_${Date.now()}`
+        await blink.db.productAnalyses.create({
+          id: analysisId,
+          userId: user?.id || 'anonymous',
+          websiteUrl: url,
+          analysisStatus: 'failed',
+          productCount: 0,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        })
+      } catch (dbError) {
+        console.error('Failed to save error to database:', dbError)
+      }
     } finally {
       setIsAnalyzing(false)
     }
@@ -530,7 +407,7 @@ Respond with JSON only:
         {/* Header */}
         <div className="text-center space-y-2">
           <h1 className="text-4xl font-bold text-gray-900">Ecommerce Product Counter</h1>
-          <p className="text-lg text-gray-600">Analyze any ecommerce website and count products across all pages</p>
+          <p className="text-lg text-gray-600">Analyze any ecommerce website and count products with AI-powered analysis</p>
         </div>
 
         {/* Main Analysis Card */}
@@ -541,7 +418,7 @@ Respond with JSON only:
               Website Analysis
             </CardTitle>
             <CardDescription>
-              Enter any ecommerce website URL to crawl all pages and count total products
+              Enter any ecommerce website URL to analyze and count all products
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
@@ -587,27 +464,12 @@ Respond with JSON only:
                 </div>
                 <Progress value={progress} className="w-full" />
                 
-                {crawlProgress && (
-                  <div className="bg-blue-50 p-4 rounded-lg space-y-3">
-                    <div className="flex items-center justify-between">
-                      <span className="font-medium text-blue-900">{crawlProgress.stage}</span>
-                      <Badge variant="secondary">
-                        {crawlProgress.pagesAnalyzed}/{crawlProgress.pagesFound} pages
-                      </Badge>
-                    </div>
-                    {crawlProgress.currentPage && (
-                      <div className="text-sm text-blue-700">
-                        <span className="font-medium">Current page:</span>
-                        <div className="truncate mt-1 bg-white p-2 rounded border">
-                          {crawlProgress.currentPage}
-                        </div>
-                      </div>
-                    )}
-                    <div className="text-lg font-bold text-blue-900">
-                      Products found so far: <span className="text-2xl text-blue-600">{crawlProgress.totalProducts}</span>
-                    </div>
+                <div className="bg-blue-50 p-4 rounded-lg">
+                  <div className="text-sm text-blue-700">
+                    <p className="font-medium">Analysis in progress...</p>
+                    <p className="mt-1">Using advanced AI to analyze both website content and visual layout for accurate product counting.</p>
                   </div>
-                )}
+                </div>
               </div>
             )}
           </CardContent>
@@ -646,7 +508,7 @@ Respond with JSON only:
                 <CardContent className="p-6">
                   <div className="flex items-center justify-between">
                     <div>
-                      <p className="text-sm font-medium text-gray-600">Avg Confidence</p>
+                      <p className="text-sm font-medium text-gray-600">Confidence</p>
                       <p className="text-3xl font-bold text-amber-600">{result.details.confidence}%</p>
                     </div>
                     <TrendingUp className="h-8 w-8 text-amber-600" />
@@ -681,14 +543,32 @@ Respond with JSON only:
                 </div>
               </CardHeader>
               <CardContent>
-                <Tabs defaultValue="pages" className="w-full">
+                <Tabs defaultValue="summary" className="w-full">
                   <TabsList className="grid w-full grid-cols-3">
-                    <TabsTrigger value="pages">Page Breakdown</TabsTrigger>
-                    <TabsTrigger value="categories">Categories</TabsTrigger>
                     <TabsTrigger value="summary">Summary</TabsTrigger>
+                    <TabsTrigger value="details">Details</TabsTrigger>
+                    <TabsTrigger value="categories">Categories</TabsTrigger>
                   </TabsList>
 
-                  <TabsContent value="pages" className="space-y-4">
+                  <TabsContent value="summary" className="space-y-4">
+                    <div className="prose max-w-none">
+                      <p className="text-gray-700">{result.summary}</p>
+                      
+                      <Separator className="my-4" />
+                      
+                      <div className="space-y-2">
+                        <h4 className="font-medium">Analysis Details:</h4>
+                        <ul className="text-sm text-gray-600 space-y-1">
+                          <li>• Method: {result.details.analysisMethod}</li>
+                          <li>• Pages analyzed: {result.pagesAnalyzed}</li>
+                          <li>• Overall confidence: {result.details.confidence}%</li>
+                          <li>• Status: {result.status}</li>
+                        </ul>
+                      </div>
+                    </div>
+                  </TabsContent>
+
+                  <TabsContent value="details" className="space-y-4">
                     <div className="space-y-3">
                       {result.pageResults.map((page, index) => (
                         <div key={index} className="border rounded-lg p-4 space-y-3">
@@ -771,25 +651,6 @@ Respond with JSON only:
                         No product categories identified
                       </div>
                     )}
-                  </TabsContent>
-
-                  <TabsContent value="summary" className="space-y-4">
-                    <div className="prose max-w-none">
-                      <p className="text-gray-700">{result.summary}</p>
-                      
-                      <Separator className="my-4" />
-                      
-                      <div className="space-y-2">
-                        <h4 className="font-medium">Analysis Details:</h4>
-                        <ul className="text-sm text-gray-600 space-y-1">
-                          <li>• Method: {result.details.analysisMethod}</li>
-                          <li>• Pages discovered: {result.sitemap.length}</li>
-                          <li>• Pages successfully analyzed: {result.pagesAnalyzed}</li>
-                          <li>• Overall confidence: {result.details.confidence}%</li>
-                          <li>• Status: {result.status}</li>
-                        </ul>
-                      </div>
-                    </div>
                   </TabsContent>
                 </Tabs>
               </CardContent>
